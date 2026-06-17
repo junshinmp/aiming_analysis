@@ -104,8 +104,50 @@ class AimAnalysis:
         self.version = self.project.version(self.version_number)
         print("Finished Loading Environment.\n")
 
-    def aim_analyzer(self, video_path: str):
-        print("Running analysis on {video_path}.")
+    def aim_analyzer(self, telemetry_path: str):
+        try:
+            print("Running analysis on {telemetry_path}.")
+            expert_data = np.load(telemetry_path)
+        except FileNotFoundError:
+            print(f"Couldn't find any telemetry data at {telemetry_path}")
+            return None
+
+        inputs = torch.tensor(expert_data, dtype=torch.float32).to(self.device)
+        model = LSTMAutoEncoder().to(self.device)
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+        model.train()
+        epochs = 15
+        batch_size = 16
+
+        for epoch in range(epochs):
+            shuffled_indices = torch.randperm(inputs.size(0))
+            running_loss = 0.0
+            
+            for i in range(0, inputs.size(0), batch_size):
+                batch_idx = shuffled_indices[i : i + batch_size]
+                batch_data = inputs[batch_idx] 
+                
+                optimizer.zero_grad()
+                
+                reconstructions = model(batch_data)
+                loss = criterion(reconstructions, batch_data)
+                loss.backward()
+                optimizer.step()
+                
+                running_loss += loss.item() * batch_data.size(0)
+                
+            average_epoch_loss = running_loss / inputs.size(0)
+            print(f"   🔹 Epoch [{epoch+1:02d}/{epochs}] | Reconstruction Loss: {average_epoch_loss:.6f}")
+
+        checkpoint_dir = Path("stage2_analytics/models")
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = checkpoint_dir / "lstm_aim_baseline.pth"
+        
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f"Baseline parameters written to: {checkpoint_path}")
+        return str(checkpoint_path)
 
     def telemetry_extraction(self, video_path: str):
         # downloads the yolo formatted data from Roboflow
@@ -195,6 +237,73 @@ class AimAnalysis:
 
         print(f"Extracted telemetry data to {str(output_filepath)}")
         return str(output_filepath)
+
+    def evaluate_gameplay(self, test_video_path: str, model_weights_path: str, threshold=0.005):
+        print(f"\nCommencing Mechanical Evaluation on: {test_video_path}")
+        
+        # Generating a temporary or fresh .npy dataset for the test video
+        print("Collecting telemetry data.")
+        test_telemetry_path = self.telemetry_extraction(test_video_path)
+        if not test_telemetry_path:
+            print("Telemetry could not be extracted from test video.")
+            return
+        
+        test_data = np.load(test_telemetry_path)
+        
+        # Convert our test matrix into an active evaluation Tensor 'x'
+        inputs = torch.tensor(test_data, dtype=torch.float32).to(self.device)
+        
+        # 3. Instantiate the model and load your optimized expert weights
+        print("Loading baseline to compare.")
+        model = LSTMAutoEncoder(input_dim=2, hidden_dim=64).to(self.device)
+        
+        try:
+            model.load_state_dict(torch.load(model_weights_path, map_location=self.device))
+            print("Baseline successfully synchronized.")
+        except FileNotFoundError:
+            print(f"Error: Weights file not found at {model_weights_path}")
+            return
+
+        # Put the model into evaluation mode
+        model.eval()
+        
+        # We process windows individually to calculate a precise timeline score
+        window_losses = []
+        
+        print("Evaluating trajectory mechanics frame-by-frame...")
+        # torch.no_grad() disables gradient tracking to save RAM and speed up execution
+        with torch.no_grad():
+            for i in range(inputs.size(0)):
+                # Isolate a single 60-frame window sequence block, unsqueezed to simulate a batch of 1
+                single_window = inputs[i].unsqueeze(0) # Shape format becomes: (1, 60, 2)
+                
+                # Forward Pass: The expert network attempts to reconstruct the test curve
+                reconstruction = model(single_window)
+                
+                # Calculate the exact Mean Squared Error discrepancy for this specific 1-second block
+                # Instead of a scalar loss, we average across the sequence features to get a single performance score
+                loss = torch.mean((reconstruction - single_window) ** 2)
+                window_losses.append(loss.item())
+
+        # keep track of the flaws in aim training
+        flaws_detected = 0
+        
+        # Loop through the results timeline
+        for idx, score in enumerate(window_losses):
+            if score > threshold:
+                # Calculate approximate video timestamp (assuming 60 FPS video capture)
+                # The window starts at 'idx' frame offset
+                timestamp_seconds = idx / 60.0
+                
+                print(f"Flaw Detected - Time: {timestamp_seconds:.2f}s | "
+                      f"Anomaly Score: {score:.6f} (Crossed limit: {threshold})")
+                flaws_detected += 1
+        
+        if flaws_detected == 0:
+            print("Audit Complete: Your mechanics match elite baseline standards flawlessly!")
+        else:
+            print(f"\nFlagged {flaws_detected} mechanical tracking instabilities.")
+            print("Review the timestamps above to isolate muscle jitters or overcorrections.")
 
 if __name__ == '__main__':
     url = 'https://www.youtube.com/watch?v=d-RGJPvFuNE'
